@@ -1,4 +1,4 @@
-#! /bin/bash
+#!/bin/bash
 # Support for Postfix features
 
 # Docs - virtual_mailbox_domains (Used in /etc/postfix/main.cf):
@@ -16,21 +16,69 @@
 # - `postmap` only seems relevant when the lookup type is one of these `file_type` values: http://www.postfix.org/postmap.1.html
 #   Should not be a concern for most types used by `docker-mailserver`: texthash, ldap, pcre, tcp, unionmap, unix.
 #   The only other type in use by `docker-mailserver` is the hash type for /etc/aliases, which `postalias` handles.
-function _create_postfix_vhost
-{
+
+function _create_postfix_vhost() {
   # `main.cf` configures `virtual_mailbox_domains = /etc/postfix/vhost`
   # NOTE: Amavis also consumes this file.
-  : >/etc/postfix/vhost
+  local DATABASE_VHOST='/etc/postfix/vhost'
+  local TMP_VHOST='/tmp/vhost.postfix.tmp'
 
-  # Account and Alias generation will store values in `/tmp/vhost.tmp`.
-  # Filter unique values to the proper config.
-  # NOTE: LDAP stores the domain value set by `docker-mailserver`,
-  # and correctly removes it from `mydestination` in `main.cf` in `setup-stack.sh`.
-  if [[ -f /tmp/vhost.tmp ]]
-  then
-    sort < /tmp/vhost.tmp | uniq >> /etc/postfix/vhost
-    rm /tmp/vhost.tmp
+  _vhost_collect_postfix_domains
+  _create_vhost
+}
+
+# Filter unique values into a proper DATABASE_VHOST config:
+function _create_vhost() {
+  : >"${DATABASE_VHOST}"
+
+  if [[ -f ${TMP_VHOST} ]]; then
+    sort < "${TMP_VHOST}" | uniq >>"${DATABASE_VHOST}"
+    rm "${TMP_VHOST}"
   fi
+}
+
+# Collects domains from configs (DATABASE_) into TMP_VHOST
+function _vhost_collect_postfix_domains() {
+  local DATABASE_ACCOUNTS='/tmp/docker-mailserver/postfix-accounts.cf'
+  local DATABASE_VIRTUAL='/tmp/docker-mailserver/postfix-virtual.cf'
+  local DOMAIN UNAME
+
+  # Extract domains from mail accounts:
+  if [[ -f ${DATABASE_ACCOUNTS} ]]; then
+    while IFS=$'|' read -r MAIL_ACCOUNT _; do
+      # It is expected valid lines have the format local-part@domain-part:
+      DOMAIN=$(cut -d '@' -f 2 <<< "${MAIL_ACCOUNT}")
+
+      echo "${DOMAIN}" >>"${TMP_VHOST}"
+    done < <(_get_valid_lines_from_file "${DATABASE_ACCOUNTS}")
+  fi
+
+  # TODO: Consider if virtual aliases should be configured to the same vhost file:
+  # https://github.com/docker-mailserver/docker-mailserver/issues/2813#issuecomment-1272394563
+  # Extract domains from virtual alias config:
+  # Aliases may have the forms: 'local-part@domain-part', only 'local-part', or '@domain-part' (wildcard catch-all)
+  if [[ -f ${DATABASE_VIRTUAL} ]]; then
+    while read -r ALIAS_FIELD _; do
+      UNAME=$(cut -d '@' -f 1 <<< "${ALIAS_FIELD}")
+      DOMAIN=$(cut -d '@' -f 2 <<< "${ALIAS_FIELD}")
+
+      # Only add valid domain-parts found:
+      # The '@' is optional for an alias key (eg: "user1     other@domain.tld"),
+      # but cut with -f2 would output the same value as it would -f1 when '@' is missing.
+      [[ ${UNAME} != "${DOMAIN}" ]] && echo "${DOMAIN}" >>"${TMP_VHOST}"
+    done < <(_get_valid_lines_from_file "${DATABASE_VIRTUAL}")
+  fi
+
+  _vhost_ldap_support
+}
+
+# Add DOMAINNAME (not an ENV, set by `helpers/dns.sh`) to vhost.
+# NOTE: `setup-stack.sh:_setup_ldap` has related logic:
+# - `main.cf:mydestination` setting removes `$mydestination` as an LDAP bugfix.
+# - `main.cf:virtual_mailbox_domains` uses `/etc/postfix/vhost`, but may
+#   conditionally include a 2nd table (ldap:/etc/postfix/ldap-domains.cf).
+function _vhost_ldap_support() {
+  [[ ${ACCOUNT_PROVISIONER} == 'LDAP' ]] && echo "${DOMAINNAME}" >>"${TMP_VHOST}"
 }
 
 # Docs - Postfix lookup table files:
@@ -50,3 +98,44 @@ function _create_postfix_vhost
 #
 # /etc/aliases is handled by `alias.sh` and uses `postalias` to update the Postfix alias database. No need for `postmap`.
 # http://www.postfix.org/postalias.1.html
+
+# Add a key with a value to Postfix's main configuration file
+# or update an existing key. An already existing key can be updated
+# by either appending to the existing value (default) or by prepending.
+#
+# @param ${1} = key name in Postfix's main configuration file
+# @param ${2} = new value (appended or prepended)
+# @param ${3} = action "append" (default) or "prepend" [OPTIONAL]
+function _add_to_or_update_postfix_main() {
+  local KEY=${1:?Key name is required}
+  local NEW_VALUE=${2:?New value is required}
+  local ACTION=${3:-append}
+  local CURRENT_VALUE
+
+  # Get current value from /etc/postfix/main.cf
+  _adjust_mtime_for_postfix_maincf
+  CURRENT_VALUE=$(postconf -h "${KEY}" 2>/dev/null)
+
+  # If key does not exist or value is empty, add it - otherwise update with ACTION:
+  if [[ -z ${CURRENT_VALUE} ]]; then
+    postconf "${KEY} = ${NEW_VALUE}"
+  else
+    # If $NEW_VALUE is already present --> nothing to do, skip.
+    if [[ " ${CURRENT_VALUE} " == *" ${NEW_VALUE} "* ]]; then
+      return 0
+    fi
+
+    case "${ACTION}" in
+      ('append')
+        postconf "${KEY} = ${CURRENT_VALUE} ${NEW_VALUE}"
+        ;;
+      ('prepend')
+        postconf "${KEY} = ${NEW_VALUE} ${CURRENT_VALUE}"
+        ;;
+      (*)
+        _log 'error' "Action '${3}' in _add_to_or_update_postfix_main is unknown"
+        return 1
+        ;;
+    esac
+  fi
+}
